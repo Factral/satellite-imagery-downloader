@@ -37,6 +37,7 @@ default_prefs = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Download satellite images for top-10 cities per country in Europe and the Americas.')
     parser.add_argument('--exclude-usa', action='store_true', help='Exclude USA from the downloading process.')
+    parser.add_argument('--out-dir', type=str, help='Output directory to save images (overrides preferences).')
     return parser.parse_args()
 
 
@@ -127,7 +128,8 @@ def run():
 
     args = parse_args()
 
-    ensure_directory(prefs['dir'])
+    out_dir = args.out_dir if getattr(args, 'out_dir', None) else prefs['dir']
+    ensure_directory(out_dir)
 
     zoom = int(prefs.get('zoom', 17))
     channels = int(prefs.get('channels', 3))
@@ -142,7 +144,7 @@ def run():
     for country_code, cities in tqdm(country_city_map.items(), desc='Countries', unit='country'):
         if not cities:
             continue
-        country_dir = os.path.join(prefs['dir'], country_code)
+        country_dir = os.path.join(out_dir, country_code)
         ensure_directory(country_dir)
 
         for city in tqdm(cities, desc=f'{country_code} cities', leave=False, unit='city'):
