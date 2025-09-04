@@ -6,6 +6,7 @@ import argparse
 from typing import Dict, List, Tuple
 from datetime import datetime
 from tqdm import tqdm
+from glob import glob
 
 from image_downloading import download_image
 
@@ -154,6 +155,14 @@ def run():
 
             tl_lat, tl_lon, br_lat, br_lon = compute_bbox_from_center(lat, lon, bbox_km)
 
+            # Build deterministic prefix for this city/zoom/window and skip if already downloaded
+            km_str = ('{:.2f}'.format(bbox_km)).rstrip('0').rstrip('.').replace('.', 'p')
+            base_prefix = f'{name}_z{zoom}_km{km_str}'
+            existing_matches = glob(os.path.join(country_dir, f'{base_prefix}*.png'))
+            if existing_matches:
+                # Already downloaded for this config
+                continue
+
             try:
                 img = download_image(tl_lat, tl_lon, br_lat, br_lon, zoom, prefs['url'],
                     prefs['headers'], tile_size, channels)
@@ -162,7 +171,7 @@ def run():
                 continue
 
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-            filename = f'{name}_z{zoom}_{timestamp}.png'
+            filename = f'{base_prefix}_{timestamp}.png'
             out_path = os.path.join(country_dir, filename)
             try:
                 cv2.imwrite(out_path, img)

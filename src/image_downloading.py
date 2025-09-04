@@ -2,15 +2,84 @@ import cv2
 import requests
 import numpy as np
 import threading
+import time
+import random
+from urllib.parse import urlparse, urlunparse
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from concurrent.futures import ThreadPoolExecutor
+from typing import Optional, Tuple
 
 
-def download_tile(url, headers, channels):
-    response = requests.get(url, headers=headers)
-    arr =  np.asarray(bytearray(response.content), dtype=np.uint8)
-    
-    if channels == 3:
-        return cv2.imdecode(arr, 1)
-    return cv2.imdecode(arr, -1)
+def _build_rotated_host_url(original_url: str, attempt_index: int) -> str:
+    parsed = urlparse(original_url)
+    host = parsed.hostname or ''
+    # Rotate mt subdomains if applicable
+    if host.endswith('google.com') and host.startswith('mt'):
+        # Replace any mt*, or mt with mt{n}
+        subdomain_index = attempt_index % 4
+        new_host = f'mt{subdomain_index}.google.com'
+        parsed = parsed._replace(netloc=new_host)
+        return urlunparse(parsed)
+    if host == 'mt.google.com':
+        subdomain_index = attempt_index % 4
+        new_host = f'mt{subdomain_index}.google.com'
+        parsed = parsed._replace(netloc=new_host)
+        return urlunparse(parsed)
+    return original_url
+
+
+def _create_session(max_retries: int = 3, backoff_factor: float = 0.5) -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=max_retries,
+        connect=max_retries,
+        read=max_retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET", "HEAD"),
+        raise_on_status=False,
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=32, pool_maxsize=64)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    return session
+
+
+def download_tile(url: str, headers: dict, channels: int, session: requests.Session,
+                  timeout: Tuple[float, float] = (5.0, 15.0), attempts: int = 4) -> Optional[np.ndarray]:
+    last_exc: Optional[Exception] = None
+    for attempt in range(attempts):
+        rotated_url = _build_rotated_host_url(url, attempt)
+        try:
+            response = session.get(rotated_url, headers=headers, timeout=timeout)
+            if response.status_code != 200:
+                last_exc = Exception(f'HTTP {response.status_code}')
+                # brief pause before retry on non-200
+                time.sleep(min(1.0, 0.25 * (attempt + 1)))
+                continue
+            arr = np.asarray(bytearray(response.content), dtype=np.uint8)
+            decoded = cv2.imdecode(arr, 1 if channels == 3 else -1)
+            if decoded is None:
+                last_exc = Exception('Failed to decode image')
+                time.sleep(min(1.0, 0.25 * (attempt + 1)))
+                continue
+            return decoded
+        except requests.exceptions.SSLError as e:
+            last_exc = e
+            time.sleep(0.5 + 0.25 * attempt)
+            continue
+        except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout) as e:
+            last_exc = e
+            time.sleep(0.5 + 0.25 * attempt)
+            continue
+        except Exception as e:
+            last_exc = e
+            time.sleep(0.25)
+            continue
+    # All attempts failed
+    return None
 
 
 # Mercator projection 
@@ -24,7 +93,8 @@ def project_with_scale(lat, lon, scale):
 
 
 def download_image(lat1: float, lon1: float, lat2: float, lon2: float,
-    zoom: int, url: str, headers: dict, tile_size: int = 256, channels: int = 3) -> np.ndarray:
+    zoom: int, url: str, headers: dict, tile_size: int = 256, channels: int = 3,
+    max_workers: int = 8, request_timeout: Tuple[float, float] = (5.0, 15.0)) -> np.ndarray:
     """
     Downloads a map region. Returns an image stored as a `numpy.ndarray` in BGR or BGRA, depending on the number
     of `channels`.
@@ -44,6 +114,10 @@ def download_image(lat1: float, lon1: float, lat2: float, lon2: float,
     `tile_size` - Tile size in pixels
 
     `channels` - Number of channels in the output image. Also affects how the tiles are converted into numpy arrays.
+
+    `max_workers` - Maximum number of threads used to download tile rows concurrently.
+
+    `request_timeout` - (connect_timeout, read_timeout) for HTTP requests.
     """
 
     scale = 1 << zoom
@@ -67,9 +141,12 @@ def download_image(lat1: float, lon1: float, lat2: float, lon2: float,
     img = np.zeros((img_h, img_w, channels), np.uint8)
 
 
+    session = _create_session()
+
     def build_row(tile_y):
         for tile_x in range(tl_tile_x, br_tile_x + 1):
-            tile = download_tile(url.format(x=tile_x, y=tile_y, z=zoom), headers, channels)
+            tile_url = url.format(x=tile_x, y=tile_y, z=zoom)
+            tile = download_tile(tile_url, headers, channels, session, timeout=request_timeout)
 
             if tile is not None:
                 # Find the pixel coordinates of the new tile relative to the image
@@ -93,14 +170,12 @@ def download_image(lat1: float, lon1: float, lat2: float, lon2: float,
                 img[img_y_l:img_y_r, img_x_l:img_x_r] = tile[cr_y_l:cr_y_r, cr_x_l:cr_x_r]
 
 
-    threads = []
-    for tile_y in range(tl_tile_y, br_tile_y + 1):
-        thread = threading.Thread(target=build_row, args=[tile_y])
-        thread.start()
-        threads.append(thread)
-    
-    for thread in threads:
-        thread.join()
+    # Limit concurrency across rows to reduce SSL and provider throttling issues
+    tile_rows = list(range(tl_tile_y, br_tile_y + 1))
+    if max_workers < 1:
+        max_workers = 1
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        list(executor.map(build_row, tile_rows))
     
     return img
 
