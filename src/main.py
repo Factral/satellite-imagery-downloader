@@ -1,7 +1,9 @@
 import os
 import json
-import re
 import cv2
+import math
+import argparse
+from typing import Dict, List, Tuple
 from datetime import datetime
 
 from image_downloading import download_image
@@ -25,58 +27,145 @@ default_prefs = {
             'upgrade-insecure-requests': '1',
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.82 Safari/537.36'
         },
-        'tl': '',
-        'br': '',
-        'zoom': ''
+        'zoom': 17,
+        'bbox_km': 20,
+        'regions': ['Europe', 'Americas'],
+        'exclude_usa': False
     }
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description='Download satellite images for top-10 cities per country in Europe and the Americas.')
+    parser.add_argument('--exclude-usa', action='store_true', help='Exclude USA from the downloading process.')
+    return parser.parse_args()
 
-def take_input(messages):
-    inputs = []
-    print('Enter "r" to reset or "q" to exit.')
-    for message in messages:
-        inp = input(message)
-        if inp == 'q' or inp == 'Q':
-            return None
-        if inp == 'r' or inp == 'R':
-            return take_input(messages)
-        inputs.append(inp)
-    return inputs
+
+def ensure_directory(path: str) -> None:
+    if not os.path.isdir(path):
+        os.makedirs(path, exist_ok=True)
+
+
+def sanitize_filename(name: str) -> str:
+    return ''.join(c for c in name if c.isalnum() or c in (' ', '-', '_')).rstrip().replace(' ', '_')
+
+
+def compute_bbox_from_center(lat: float, lon: float, window_km: float) -> Tuple[float, float, float, float]:
+    # Interpret window_km as half-side distance around the center (Δm)
+    delta_meters = window_km * 1000.0
+    dlat = delta_meters / 111320.0
+    dlon = delta_meters / (111320.0 * max(0.00001, math.cos(math.radians(lat))))
+    tl_lat = lat + dlat
+    tl_lon = lon - dlon
+    br_lat = lat - dlat
+    br_lon = lon + dlon
+    return tl_lat, tl_lon, br_lat, br_lon
+
+
+def get_target_country_iso2_codes(exclude_usa: bool) -> List[str]:
+    import geonamescache
+
+    gc = geonamescache.GeonamesCache()
+    countries: Dict[str, Dict] = gc.get_countries()
+    target_iso2: List[str] = []
+
+    for _, country in countries.items():
+        continent_code = country.get('continentcode')
+        # Americas: NA + SA; Europe: EU
+        if continent_code in ('EU', 'NA', 'SA'):
+            iso2 = country.get('iso')
+            if not iso2:
+                continue
+            if exclude_usa and iso2.upper() == 'US':
+                continue
+            target_iso2.append(iso2.upper())
+    return sorted(set(target_iso2))
+
+
+def top_cities_by_country(iso2_codes: List[str], top_n: int = 10) -> Dict[str, List[Dict]]:
+    import geonamescache
+
+    gc = geonamescache.GeonamesCache()
+    cities = gc.get_cities()
+
+    country_to_cities: Dict[str, List[Dict]] = {code: [] for code in iso2_codes}
+    for _, city in cities.items():
+        code = str(city.get('countrycode', '')).upper()
+        if code not in country_to_cities:
+            continue
+        try:
+            population = int(city.get('population') or 0)
+        except Exception:
+            population = 0
+        if population <= 0:
+            continue
+        lat = city.get('latitude')
+        lon = city.get('longitude')
+        if lat is None or lon is None:
+            continue
+        try:
+            lat_f = float(lat)
+            lon_f = float(lon)
+        except Exception:
+            continue
+        country_to_cities[code].append({
+            'name': city.get('name', 'unknown'),
+            'lat': lat_f,
+            'lon': lon_f,
+            'population': population
+        })
+
+    for code in list(country_to_cities.keys()):
+        ranked = sorted(country_to_cities[code], key=lambda c: c['population'], reverse=True)
+        country_to_cities[code] = ranked[:top_n]
+
+    return country_to_cities
 
 
 def run():
     with open(os.path.join(file_dir, 'preferences.json'), 'r', encoding='utf-8') as f:
         prefs = json.loads(f.read())
 
-    if not os.path.isdir(prefs['dir']):
-        os.mkdir(prefs['dir'])
+    args = parse_args()
 
-    if (prefs['tl'] == '') or (prefs['br'] == '') or (prefs['zoom'] == ''):
-        messages = ['Top-left corner: ', 'Bottom-right corner: ', 'Zoom level: ']
-        inputs = take_input(messages)
-        if inputs is None:
-            return
-        else:
-            prefs['tl'], prefs['br'], prefs['zoom'] = inputs
+    ensure_directory(prefs['dir'])
 
-    lat1, lon1 = re.findall(r'[+-]?\d*\.\d+|d+', prefs['tl'])
-    lat2, lon2 = re.findall(r'[+-]?\d*\.\d+|d+', prefs['br'])
+    zoom = int(prefs.get('zoom', 17))
+    channels = int(prefs.get('channels', 3))
+    tile_size = int(prefs.get('tile_size', 256))
+    bbox_km = float(prefs.get('bbox_km', 20))
 
-    zoom = int(prefs['zoom'])
-    channels = int(prefs['channels'])
-    tile_size = int(prefs['tile_size'])
-    lat1 = float(lat1)
-    lon1 = float(lon1)
-    lat2 = float(lat2)
-    lon2 = float(lon2)
+    exclude_usa = bool(prefs.get('exclude_usa', False) or args.exclude_usa)
 
-    img = download_image(lat1, lon1, lat2, lon2, zoom, prefs['url'],
-        prefs['headers'], tile_size, channels)
+    target_countries = get_target_country_iso2_codes(exclude_usa=exclude_usa)
+    country_city_map = top_cities_by_country(target_countries, top_n=10)
 
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    name = f'img_{timestamp}.png'
-    cv2.imwrite(os.path.join(prefs['dir'], name), img)
-    print(f'Saved as {name}')
+    for country_code, cities in country_city_map.items():
+        if not cities:
+            continue
+        country_dir = os.path.join(prefs['dir'], country_code)
+        ensure_directory(country_dir)
+
+        for city in cities:
+            name = sanitize_filename(city['name'])
+            lat = city['lat']
+            lon = city['lon']
+
+            tl_lat, tl_lon, br_lat, br_lon = compute_bbox_from_center(lat, lon, bbox_km)
+
+            try:
+                img = download_image(tl_lat, tl_lon, br_lat, br_lon, zoom, prefs['url'],
+                    prefs['headers'], tile_size, channels)
+            except Exception as e:
+                print(f'Failed to download {country_code}/{name} at z{zoom}: {e}')
+                continue
+
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            filename = f'{name}_z{zoom}_{timestamp}.png'
+            out_path = os.path.join(country_dir, filename)
+            try:
+                cv2.imwrite(out_path, img)
+                print(f'Saved {out_path}')
+            except Exception as e:
+                print(f'Failed to save {out_path}: {e}')
 
 
 if os.path.isfile(prefs_path):
