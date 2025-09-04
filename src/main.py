@@ -5,6 +5,7 @@ import math
 import argparse
 from typing import Dict, List, Tuple
 from datetime import datetime
+from tqdm import tqdm
 
 from image_downloading import download_image
 
@@ -138,13 +139,13 @@ def run():
     target_countries = get_target_country_iso2_codes(exclude_usa=exclude_usa)
     country_city_map = top_cities_by_country(target_countries, top_n=10)
 
-    for country_code, cities in country_city_map.items():
+    for country_code, cities in tqdm(country_city_map.items(), desc='Countries', unit='country'):
         if not cities:
             continue
         country_dir = os.path.join(prefs['dir'], country_code)
         ensure_directory(country_dir)
 
-        for city in cities:
+        for city in tqdm(cities, desc=f'{country_code} cities', leave=False, unit='city'):
             name = sanitize_filename(city['name'])
             lat = city['lat']
             lon = city['lon']
