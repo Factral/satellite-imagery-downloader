@@ -9,6 +9,7 @@ from tqdm import tqdm
 from glob import glob
 
 from image_downloading import download_image
+import pyvips
 
 file_dir = os.path.dirname(__file__)
 prefs_path = os.path.join(file_dir, 'preferences.json')
@@ -17,6 +18,7 @@ default_prefs = {
         'tile_size': 256,
         'channels': 3,
         'dir': os.path.join(file_dir, 'images'),
+        'output_format': 'vips',  # png | vips | tiff
         'headers': {
             'cache-control': 'max-age=0',
             'sec-ch-ua': '" Not A;Brand";v="99", "Chromium";v="99", "Google Chrome";v="99"',
@@ -39,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Download satellite images for top-10 cities per country in Europe and the Americas.')
     parser.add_argument('--exclude-usa', action='store_true', help='Exclude USA from the downloading process.')
     parser.add_argument('--out-dir', type=str, help='Output directory to save images (overrides preferences).')
+    parser.add_argument('--format', dest='output_format', choices=['png', 'vips', 'tiff'], help='Output format: png, vips (.v), or tiled tiff (.tif).')
     return parser.parse_args()
 
 
@@ -61,6 +64,36 @@ def compute_bbox_from_center(lat: float, lon: float, window_km: float) -> Tuple[
     br_lat = lat - dlat
     br_lon = lon + dlon
     return tl_lat, tl_lon, br_lat, br_lon
+
+
+def save_image_with_format(img, out_path: str, fmt: str, channels: int) -> None:
+    fmt = fmt.lower()
+    if fmt == 'png':
+        cv2.imwrite(out_path, img)
+        return
+    # Convert OpenCV BGR/BGRA to RGB/RGBA as pyvips expects
+    if channels == 3:
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        height, width = img_rgb.shape[:2]
+        vimage = pyvips.Image.new_from_memory(img_rgb.tobytes(), width, height, 3, 'uchar')
+    else:
+        # Assume BGRA -> RGBA
+        img_rgba = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
+        height, width = img_rgba.shape[:2]
+        vimage = pyvips.Image.new_from_memory(img_rgba.tobytes(), width, height, 4, 'uchar')
+
+    if fmt == 'vips':
+        # .v format, random-access friendly
+        vimage.write_to_file(out_path)
+        return
+    if fmt == 'tiff':
+        # Tiled, BigTIFF, with LZW compression for balance; pyramids optional
+        # Use tile size 256 for compatibility with our input tiles
+        vimage.tiffsave(out_path, tile=True, tile_width=256, tile_height=256,
+                        bigtiff=True, compression='lzw', pyramid=False)
+        return
+    # Fallback to PNG
+    cv2.imwrite(out_path, img)
 
 
 def get_target_country_iso2_codes(exclude_usa: bool) -> List[str]:
@@ -138,6 +171,11 @@ def run():
     bbox_km = float(prefs.get('bbox_km', 20))
 
     exclude_usa = bool(prefs.get('exclude_usa', False) or args.exclude_usa)
+    output_format = (args.output_format or prefs.get('output_format', 'png')).lower()
+    if output_format not in ('png', 'vips', 'tiff'):
+        output_format = 'png'
+    ext_by_fmt = {'png': 'png', 'vips': 'v', 'tiff': 'tif'}
+    out_ext = ext_by_fmt[output_format]
 
     target_countries = get_target_country_iso2_codes(exclude_usa=exclude_usa)
     country_city_map = top_cities_by_country(target_countries, top_n=10)
@@ -158,7 +196,7 @@ def run():
             # Build deterministic prefix for this city/zoom/window and skip if already downloaded
             km_str = ('{:.2f}'.format(bbox_km)).rstrip('0').rstrip('.').replace('.', 'p')
             base_prefix = f'{name}_z{zoom}_km{km_str}'
-            existing_matches = glob(os.path.join(country_dir, f'{base_prefix}*.png'))
+            existing_matches = glob(os.path.join(country_dir, f'{base_prefix}*.{out_ext}'))
             if existing_matches:
                 # Already downloaded for this config
                 continue
@@ -171,10 +209,10 @@ def run():
                 continue
 
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-            filename = f'{base_prefix}_{timestamp}.png'
+            filename = f'{base_prefix}_{timestamp}.{out_ext}'
             out_path = os.path.join(country_dir, filename)
             try:
-                cv2.imwrite(out_path, img)
+                save_image_with_format(img, out_path, output_format, channels)
                 print(f'Saved {out_path}')
             except Exception as e:
                 print(f'Failed to save {out_path}: {e}')

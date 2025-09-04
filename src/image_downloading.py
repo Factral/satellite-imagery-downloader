@@ -94,7 +94,7 @@ def project_with_scale(lat, lon, scale):
 
 def download_image(lat1: float, lon1: float, lat2: float, lon2: float,
     zoom: int, url: str, headers: dict, tile_size: int = 256, channels: int = 3,
-    max_workers: int = 8, request_timeout: Tuple[float, float] = (5.0, 15.0)) -> np.ndarray:
+    max_workers: int = 16, request_timeout: Tuple[float, float] = (5.0, 15.0)) -> np.ndarray:
     """
     Downloads a map region. Returns an image stored as a `numpy.ndarray` in BGR or BGRA, depending on the number
     of `channels`.
