@@ -7,41 +7,40 @@ from typing import Dict, List, Tuple
 from datetime import datetime
 from tqdm import tqdm
 from glob import glob
-
-from image_downloading import download_image
 import pyvips
 
+from image_downloading import download_image
+
+
 file_dir = os.path.dirname(__file__)
-prefs_path = os.path.join(file_dir, 'preferences.json')
+prefs_path = os.path.join(file_dir, 'mapbox_preferences.json')
+
 default_prefs = {
-        'url': 'https://mt.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
+        'style': 'mapbox/satellite-v9',
+        'mapbox_token': 'pk.eyJ1IjoiZmFjdHJhbCIsImEiOiJjbWV2aDJxZzYwaHB3MnNtdzNhbjdwbnB3In0.lkjBoSHDlskjHDt_xVUGzw',
         'tile_size': 256,
         'channels': 3,
-        'dir': os.path.join(file_dir, 'images'),
+        'dir': os.path.join(file_dir, 'images_mapbox'),
         'output_format': 'vips',  # png | vips | tiff
         'headers': {
-            'cache-control': 'max-age=0',
-            'sec-ch-ua': '" Not A;Brand";v="99", "Chromium";v="99", "Google Chrome";v="99"',
-            'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"Windows"',
-            'sec-fetch-dest': 'document',
-            'sec-fetch-mode': 'navigate',
-            'sec-fetch-site': 'none',
-            'sec-fetch-user': '?1',
-            'upgrade-insecure-requests': '1',
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.82 Safari/537.36'
+            'user-agent': 'satellite-imagery-downloader/1.0'
         },
         'zoom': 17,
         'bbox_km': 20,
-        'regions': ['Europe', 'Americas'],
-        'exclude_usa': False
+        'exclude_usa': False,
+        'max_workers': 32,
+        'request_timeout': [8.0, 25.0]
     }
 
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='Download satellite images for top-10 cities per country in Europe and the Americas.')
+    parser = argparse.ArgumentParser(description='Download satellite images (Mapbox) for top-10 cities per country in Europe and the Americas.')
     parser.add_argument('--exclude-usa', action='store_true', help='Exclude USA from the downloading process.')
     parser.add_argument('--out-dir', type=str, help='Output directory to save images (overrides preferences).')
     parser.add_argument('--format', dest='output_format', choices=['png', 'vips', 'tiff'], help='Output format: png, vips (.v), or tiled tiff (.tif).')
+    parser.add_argument('--token', dest='mapbox_token', type=str, help='Mapbox access token.')
+    parser.add_argument('--style', type=str, default=None, help='Mapbox style, e.g., mapbox/satellite-v9')
+    parser.add_argument('--max-workers', type=int, default=None, help='Max workers for tile downloads.')
     return parser.parse_args()
 
 
@@ -55,7 +54,6 @@ def sanitize_filename(name: str) -> str:
 
 
 def compute_bbox_from_center(lat: float, lon: float, window_km: float) -> Tuple[float, float, float, float]:
-    # Interpret window_km as half-side distance around the center (Δm)
     delta_meters = window_km * 1000.0
     dlat = delta_meters / 111320.0
     dlon = delta_meters / (111320.0 * max(0.00001, math.cos(math.radians(lat))))
@@ -71,28 +69,22 @@ def save_image_with_format(img, out_path: str, fmt: str, channels: int) -> None:
     if fmt == 'png':
         cv2.imwrite(out_path, img)
         return
-    # Convert OpenCV BGR/BGRA to RGB/RGBA as pyvips expects
     if channels == 3:
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         height, width = img_rgb.shape[:2]
         vimage = pyvips.Image.new_from_memory(img_rgb.tobytes(), width, height, 3, 'uchar')
     else:
-        # Assume BGRA -> RGBA
         img_rgba = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
         height, width = img_rgba.shape[:2]
         vimage = pyvips.Image.new_from_memory(img_rgba.tobytes(), width, height, 4, 'uchar')
 
     if fmt == 'vips':
-        # .v format, random-access friendly
         vimage.write_to_file(out_path)
         return
     if fmt == 'tiff':
-        # Tiled, BigTIFF, with LZW compression for balance; pyramids optional
-        # Use tile size 256 for compatibility with our input tiles
         vimage.tiffsave(out_path, tile=True, tile_width=256, tile_height=256,
                         bigtiff=True, compression='lzw', pyramid=False)
         return
-    # Fallback to PNG
     cv2.imwrite(out_path, img)
 
 
@@ -105,7 +97,6 @@ def get_target_country_iso2_codes(exclude_usa: bool) -> List[str]:
 
     for _, country in countries.items():
         continent_code = country.get('continentcode')
-        # Americas: NA + SA; Europe: EU
         if continent_code in ('EU', 'NA', 'SA'):
             iso2 = country.get('iso')
             if not iso2:
@@ -157,8 +148,14 @@ def top_cities_by_country(iso2_codes: List[str], top_n: int = 10) -> Dict[str, L
 
 
 def run():
-    with open(os.path.join(file_dir, 'preferences.json'), 'r', encoding='utf-8') as f:
-        prefs = json.loads(f.read())
+    if os.path.isfile(prefs_path):
+        with open(prefs_path, 'r', encoding='utf-8') as f:
+            prefs = json.loads(f.read())
+    else:
+        prefs = default_prefs
+        with open(prefs_path, 'w', encoding='utf-8') as f:
+            json.dump(default_prefs, f, indent=2, ensure_ascii=False)
+        print(f'Preferences file created in {prefs_path}')
 
     args = parse_args()
 
@@ -171,11 +168,28 @@ def run():
     bbox_km = float(prefs.get('bbox_km', 20))
 
     exclude_usa = bool(prefs.get('exclude_usa', False) or args.exclude_usa)
-    output_format = (args.output_format or prefs.get('output_format', 'png')).lower()
+    output_format = (args.output_format or prefs.get('output_format', 'vips')).lower()
     if output_format not in ('png', 'vips', 'tiff'):
-        output_format = 'png'
+        output_format = 'vips'
     ext_by_fmt = {'png': 'png', 'vips': 'v', 'tiff': 'tif'}
     out_ext = ext_by_fmt[output_format]
+
+    style = args.style or prefs.get('style', 'mapbox/satellite-v9')
+    token = args.mapbox_token or prefs.get('mapbox_token')
+    if not token:
+        raise RuntimeError('Mapbox token is required. Provide via --token or preferences.')
+
+    # Build a URL template for tiles with attribution=false
+    # Keep {z}/{x}/{y} placeholders for the downloader to fill per-tile
+    url_template = f'https://api.mapbox.com/styles/v1/{style}/tiles/{tile_size}' + '/{z}/{x}/{y}?access_token=' + token + '&attribution=false'
+
+    # Request settings
+    max_workers = int(args.max_workers if args.max_workers is not None else prefs.get('max_workers', 8))
+    rt = prefs.get('request_timeout', [8.0, 25.0])
+    if isinstance(rt, list) and len(rt) == 2:
+        request_timeout = (float(rt[0]), float(rt[1]))
+    else:
+        request_timeout = (8.0, 25.0)
 
     target_countries = get_target_country_iso2_codes(exclude_usa=exclude_usa)
     country_city_map = top_cities_by_country(target_countries, top_n=10)
@@ -193,17 +207,15 @@ def run():
 
             tl_lat, tl_lon, br_lat, br_lon = compute_bbox_from_center(lat, lon, bbox_km)
 
-            # Build deterministic prefix for this city/zoom/window and skip if already downloaded
             km_str = ('{:.2f}'.format(bbox_km)).rstrip('0').rstrip('.').replace('.', 'p')
             base_prefix = f'{name}_z{zoom}_km{km_str}'
             existing_matches = glob(os.path.join(country_dir, f'{base_prefix}*.{out_ext}'))
             if existing_matches:
-                # Already downloaded for this config
                 continue
 
             try:
-                img = download_image(tl_lat, tl_lon, br_lat, br_lon, zoom, prefs['url'],
-                    prefs['headers'], tile_size, channels)
+                img = download_image(tl_lat, tl_lon, br_lat, br_lon, zoom, url_template,
+                    prefs['headers'], tile_size, channels, max_workers=max_workers, request_timeout=request_timeout)
             except Exception as e:
                 print(f'Failed to download {country_code}/{name} at z{zoom}: {e}')
                 continue
@@ -218,13 +230,8 @@ def run():
                 print(f'Failed to save {out_path}: {e}')
 
 
-if os.path.isfile(prefs_path):
+if __name__ == '__main__':
     run()
-else:
-    with open(prefs_path, 'w', encoding='utf-8') as f:
-        json.dump(default_prefs, f, indent=2, ensure_ascii=False)
-
-    print(f'Preferences file created in {prefs_path}')
 
 
-#python main.py --out-dir /lustre/scratch/fabian/images/ --format vips
+#python main_mapbox.py --out-dir /lustre/scratch/fabian/images2/ --format vips
