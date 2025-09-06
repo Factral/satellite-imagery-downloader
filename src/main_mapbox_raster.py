@@ -13,14 +13,16 @@ from image_downloading import download_image
 
 
 file_dir = os.path.dirname(__file__)
-prefs_path = os.path.join(file_dir, 'mapbox_preferences.json')
+prefs_path = os.path.join(file_dir, 'mapbox_raster_preferences.json')
 
 default_prefs = {
-        'style': 'mapbox/satellite-v9',
+        'tilesets': 'mapbox.satellite',  # comma-separated tileset IDs username.id
         'mapbox_token': 'pk.eyJ1IjoiZmFjdHJhbCIsImEiOiJjbWV2aDJxZzYwaHB3MnNtdzNhbjdwbnB3In0.lkjBoSHDlskjHDt_xVUGzw',
-        'tile_size': 512,
+        'tile_size': 512,  # 512 is default for Raster Tiles API
+        'pixel_ratio': 1,  # 1 or 2 (for @2x)
+        'raster_format': 'png',  # png, png32, jpg70, jpg80, jpg90
         'channels': 3,
-        'dir': os.path.join(file_dir, 'images_mapbox'),
+        'dir': os.path.join(file_dir, 'images_mapbox_raster'),
         'output_format': 'vips',  # png | vips | tiff
         'headers': {
             'user-agent': 'satellite-imagery-downloader/1.0'
@@ -28,18 +30,20 @@ default_prefs = {
         'zoom': 16,
         'bbox_km': 20,
         'exclude_usa': False,
-        'max_workers': 32,
+        'max_workers': 24,
         'request_timeout': [8.0, 25.0]
     }
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='Download satellite images (Mapbox) for top-10 cities per country in Europe and the Americas.')
+    parser = argparse.ArgumentParser(description='Download satellite images (Mapbox Raster Tiles API) for top-10 cities by country.')
     parser.add_argument('--exclude-usa', action='store_true', help='Exclude USA from the downloading process.')
     parser.add_argument('--out-dir', type=str, help='Output directory to save images (overrides preferences).')
     parser.add_argument('--format', dest='output_format', choices=['png', 'vips', 'tiff'], help='Output format: png, vips (.v), or tiled tiff (.tif).')
     parser.add_argument('--token', dest='mapbox_token', type=str, help='Mapbox access token.')
-    parser.add_argument('--style', type=str, default=None, help='Mapbox style, e.g., mapbox/satellite-v9')
+    parser.add_argument('--tilesets', type=str, default=None, help='Comma-separated tileset IDs (username.id). Default mapbox.satellite')
+    parser.add_argument('--pixel-ratio', type=int, choices=[1, 2], default=None, help='Pixel ratio for @2x (1 or 2).')
+    parser.add_argument('--raster-format', type=str, choices=['png', 'png32', 'jpg70', 'jpg80', 'jpg90'], default=None, help='Raster format')
     parser.add_argument('--max-workers', type=int, default=None, help='Max workers for tile downloads.')
     return parser.parse_args()
 
@@ -147,6 +151,15 @@ def top_cities_by_country(iso2_codes: List[str], top_n: int = 10) -> Dict[str, L
     return country_to_cities
 
 
+def build_raster_tiles_url_template(tilesets: str, tile_size: int, pixel_ratio: int, raster_format: str, token: str) -> str:
+    # Endpoint per Mapbox Raster Tiles API:
+    # https://api.mapbox.com/v4/{tilesets}/{z}/{x}/{y}{@2x}.{format}?access_token=TOKEN
+    # tilesets: comma-separated up to 15
+    ratio_suffix = '@2x' if int(pixel_ratio) == 2 else ''
+    # tile_size is 512 by default for Raster Tiles, @2x doubles pixel density, not geographic coverage
+    return f'https://api.mapbox.com/v4/{tilesets}' + '/{z}/{x}/{y}' + f'{ratio_suffix}.{raster_format}?access_token={token}'
+
+
 def run():
     if os.path.isfile(prefs_path):
         with open(prefs_path, 'r', encoding='utf-8') as f:
@@ -164,7 +177,7 @@ def run():
 
     zoom = int(prefs.get('zoom', 17))
     channels = int(prefs.get('channels', 3))
-    tile_size = int(prefs.get('tile_size', 256))
+    tile_size = int(prefs.get('tile_size', 512))
     bbox_km = float(prefs.get('bbox_km', 20))
 
     exclude_usa = bool(prefs.get('exclude_usa', False) or args.exclude_usa)
@@ -174,22 +187,24 @@ def run():
     ext_by_fmt = {'png': 'png', 'vips': 'v', 'tiff': 'tif'}
     out_ext = ext_by_fmt[output_format]
 
-    style = args.style or prefs.get('style', 'mapbox/satellite-v9')
+    tilesets = (args.tilesets or prefs.get('tilesets', 'mapbox.satellite'))
     token = args.mapbox_token or prefs.get('mapbox_token')
     if not token:
         raise RuntimeError('Mapbox token is required. Provide via --token or preferences.')
-
-    # Build a URL template for tiles with attribution=false
-    # Keep {z}/{x}/{y} placeholders for the downloader to fill per-tile
-    url_template = f'https://api.mapbox.com/styles/v1/{style}/tiles/{tile_size}' + '/{z}/{x}/{y}?access_token=' + token + '&attribution=false'
+    pixel_ratio = int(args.pixel_ratio if args.pixel_ratio is not None else prefs.get('pixel_ratio', 1))
+    raster_format = (args.raster_format or prefs.get('raster_format', 'png')).lower()
+    if raster_format not in ('png', 'png32', 'jpg70', 'jpg80', 'jpg90'):
+        raster_format = 'png'
 
     # Request settings
-    max_workers = int(args.max_workers if args.max_workers is not None else prefs.get('max_workers', 8))
+    max_workers = int(args.max_workers if args.max_workers is not None else prefs.get('max_workers', 24))
     rt = prefs.get('request_timeout', [8.0, 25.0])
     if isinstance(rt, list) and len(rt) == 2:
         request_timeout = (float(rt[0]), float(rt[1]))
     else:
         request_timeout = (8.0, 25.0)
+
+    url_template = build_raster_tiles_url_template(tilesets, tile_size, pixel_ratio, raster_format, token)
 
     target_countries = get_target_country_iso2_codes(exclude_usa=exclude_usa)
     country_city_map = top_cities_by_country(target_countries, top_n=10)
@@ -233,5 +248,4 @@ def run():
 if __name__ == '__main__':
     run()
 
-
-#python main_mapbox.py --out-dir /lustre/scratch/fabian/images2/ --format vips
+ 
