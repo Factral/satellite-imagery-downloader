@@ -18,7 +18,7 @@ prefs_path = os.path.join(file_dir, 'mapbox_raster_preferences.json')
 default_prefs = {
         'tilesets': 'mapbox.satellite',  # comma-separated tileset IDs username.id
         'mapbox_token': 'pk.eyJ1IjoiZmFjdHJhbCIsImEiOiJjbWV2aDJxZzYwaHB3MnNtdzNhbjdwbnB3In0.lkjBoSHDlskjHDt_xVUGzw',
-        'tile_size': 512,  # 512 is default for Raster Tiles API
+        'tile_size': 256,  # 512 is default for Raster Tiles API
         'pixel_ratio': 1,  # 1 or 2 (for @2x)
         'raster_format': 'png',  # png, png32, jpg70, jpg80, jpg90
         'channels': 3,
