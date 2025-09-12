@@ -187,48 +187,79 @@ def _find_existing_tile(base_name: str) -> Optional[str]:
     return None
 
 
+def _asset_base_name_from_item(item) -> Optional[str]:
+    try:
+        # Use raw assets without signing to compute stable base name
+        if hasattr(item, "assets") and item.assets:
+            img = item.assets.get("image")
+            if img and getattr(img, "href", None):
+                return os.path.basename(str(img.href).split("?", 1)[0])
+            for a in item.assets.values():
+                href = getattr(a, "href", "") or ""
+                if href and (href.lower().endswith((".tif", ".tiff")) or "tiff" in (getattr(a, "media_type", "") or "")):
+                    return os.path.basename(str(href).split("?", 1)[0])
+    except Exception:
+        return None
+    return None
+
+
+def _download_item_fresh_signed(item, dest: str, overwrite: bool) -> str:
+    # Generate a fresh signed href per attempt to avoid SAS expiry during long runs
+    attempts = 0
+    while attempts < 3:
+        attempts += 1
+        url = _asset_href_from_item(item)
+        if not url:
+            raise RuntimeError("Could not resolve asset href for item")
+        try:
+            return _download_url(url, dest, overwrite)
+        except Exception:
+            if attempts >= 3:
+                raise
+    return dest
+
+
 def download_tiles_for_geom(geom: BaseGeometry, year: int, dst_dir: str, max_items: int, overwrite: bool) -> List[str]:
     ensure_dir(dst_dir)
     items = _iter_naip_items_for_year(geom, year)
     if not items:
         return []
-    hrefs: List[Tuple[str, str]] = []
+    entries: List[Tuple[object, str]] = []  # (item, dest)
     for it in items:
-        href = _asset_href_from_item(it)
-        if not href:
-            continue
-        base = os.path.basename(href.split("?", 1)[0])
-        if not base.lower().endswith((".tif", ".tiff")):
-            base = f"{it.id}.tif"
+        base = _asset_base_name_from_item(it) or f"{it.id}.tif"
         dest = os.path.join(dst_dir, base)
-        hrefs.append((href, dest))
+        entries.append((it, dest))
     if max_items and max_items > 0:
-        hrefs = hrefs[: max_items]
+        entries = entries[: max_items]
 
     results: List[str] = []
     to_download: List[Tuple[str, str]] = []
-    for href, dest in hrefs:
+    reused = 0
+    for it, dest in entries:
         base = os.path.basename(dest)
         existing = _find_existing_tile(base)
         if existing and (not overwrite):
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            try:
-                os.link(existing, dest)
-            except Exception:
-                import shutil
-                shutil.copy2(existing, dest)
-            results.append(dest)
+            # Reuse existing tile path directly (no copy) to enable resume
+            results.append(existing)
+            print(f"Reused existing tile: {base}")
+            reused += 1
         else:
-            to_download.append((href, dest))
+            to_download.append((it, dest))
 
     if to_download:
         workers = max(1, getattr(args_global, "tile_workers", 8))
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            future_to_target = {ex.submit(_download_url, href, dest, overwrite): dest for href, dest in to_download}
+            future_to_target = {ex.submit(_download_item_fresh_signed, it, dest, overwrite): dest for it, dest in to_download}
             for fut in tqdm(as_completed(future_to_target), total=len(future_to_target), desc="NAIP tiles", unit="tile"):
                 dest = future_to_target[fut]
                 fut.result()
                 results.append(dest)
+
+    if reused:
+        try:
+            print(f"Reused {reused} existing tiles from outdir")
+        except Exception:
+            pass
 
     return results
 
