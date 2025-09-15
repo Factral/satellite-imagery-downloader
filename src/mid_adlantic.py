@@ -18,7 +18,7 @@ Usage example:
   python download_mid_atlantic.py \
     --outdir /work/nvme/bfbw/fperez2/datasets/naip_midatl \
     --tmpdir /work/nvme/bfbw/fperez2/tmp \
-    --tile-workers 32 --max-workers 8 --overwrite
+    --tile-workers 32 --overwrite
 """
 
 import os
@@ -272,10 +272,27 @@ def mosaic_rgb_1m(tifs: List[str], bbox_geom: BaseGeometry, out_tif: str, target
         vrts = []
         for s in srcs:
             if s.crs != target_crs:
-                vrts.append(WarpedVRT(s, crs=target_crs, resampling=Resampling.nearest, add_alpha=True))
+                try:
+                    vrts.append(WarpedVRT(
+                        s,
+                        crs=target_crs,
+                        resampling=Resampling.nearest,
+                        add_alpha=True,
+                        warp_extras={"NUM_THREADS": "ALL_CPUS"}
+                    ))
+                except TypeError:
+                    vrts.append(WarpedVRT(s, crs=target_crs, resampling=Resampling.nearest, add_alpha=True))
             else:
                 try:
-                    vrts.append(WarpedVRT(s, add_alpha=True, resampling=Resampling.nearest))
+                    try:
+                        vrts.append(WarpedVRT(
+                            s,
+                            add_alpha=True,
+                            resampling=Resampling.nearest,
+                            warp_extras={"NUM_THREADS": "ALL_CPUS"}
+                        ))
+                    except TypeError:
+                        vrts.append(WarpedVRT(s, add_alpha=True, resampling=Resampling.nearest))
                 except Exception:
                     vrts.append(s)
         minx, miny, maxx, maxy = transform_bounds("EPSG:4326", target_crs, *bbox_geom.bounds, densify_pts=21)
@@ -344,14 +361,22 @@ def fetch_states(states: List[str]) -> gpd.GeoDataFrame:
 
 
 def main():
-    cpu_default = multiprocessing.cpu_count()
-    cpu_default = 32
+    # Favor multi-threaded warps/reads during mosaics
+    os.environ.setdefault("GDAL_NUM_THREADS", "ALL_CPUS")
+    # Set a reasonable GDAL cache (in MB). Adjust if needed for your system.
+    os.environ.setdefault("GDAL_CACHEMAX", "1024")
+
+    # Dynamic default for tile download workers (network-bound, benefit from higher concurrency)
+    try:
+        tile_workers_default = max(8, min(64, multiprocessing.cpu_count() * 4))
+    except Exception:
+        tile_workers_default = 16
+
     ap = argparse.ArgumentParser(description="Download NAIP 1m for Mid-Atlantic (per-state and merged)")
     ap.add_argument("--states", nargs="*", default=MID_ATLANTIC_STATES, help="State USPS codes to include")
     ap.add_argument("--year", type=int, default=None, help="Force NAIP year; default: most recent per state")
     ap.add_argument("--max-per-year", type=int, default=0, help="Max tiles per state (0=all)")
-    ap.add_argument("--tile-workers", type=int, default=16, help="Parallel tile downloads per state")
-    ap.add_argument("--max-workers", type=int, default=cpu_default, help="Parallel states")
+    ap.add_argument("--tile-workers", type=int, default=tile_workers_default, help="Parallel tile downloads per state")
     ap.add_argument("--outdir", type=str, required=True, help="Output directory for mosaics and tiles reuse")
     ap.add_argument("--tmpdir", type=str, default=None, help="Temporary directory (defaults to parent of outdir)")
     ap.add_argument("--overwrite", action="store_true", help="Redownload/rebuild if exists")
@@ -404,12 +429,11 @@ def main():
                 print(f"[{st}] Done: {os.path.basename(out_tif)}")
             return out_tif
 
-    with ThreadPoolExecutor(max_workers=args.max_workers) as ex:
-        futures = [ex.submit(process_state, row) for _, row in states_gdf.iterrows()]
-        for fut in as_completed(futures):
-            out = fut.result()
-            if out:
-                per_state_outputs.append(out)
+    # Process states sequentially to limit memory and output size pressure
+    for _, row in states_gdf.iterrows():
+        out = process_state(row)
+        if out:
+            per_state_outputs.append(out)
 
     # Combined mosaic across states
     if per_state_outputs:
