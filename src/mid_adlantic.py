@@ -41,6 +41,9 @@ from rasterio.merge import merge as rio_merge
 from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform_bounds
 from rasterio.enums import Resampling
+from rasterio.transform import from_origin
+
+import numpy as np
 
 import requests
 from tqdm import tqdm
@@ -335,6 +338,124 @@ def mosaic_rgb_1m(tifs: List[str], bbox_geom: BaseGeometry, out_tif: str, target
                 pass
 
 
+def mosaic_streaming_rgb_1m(src_paths: List[str], bounds_geom: BaseGeometry, out_tif: str, chunk_size: int = 1024, target_crs: str = "EPSG:5070") -> None:
+    if not src_paths:
+        raise ValueError("No inputs to mosaic")
+
+    srcs = [rasterio.open(p) for p in src_paths]
+    try:
+        # Determine target CRS and bounds in that CRS
+        crs = None
+        try:
+            crs = srcs[0].crs
+        except Exception:
+            pass
+        if not crs:
+            crs = target_crs
+
+        minx, miny, maxx, maxy = transform_bounds("EPSG:4326", crs, *bounds_geom.bounds, densify_pts=21)
+
+        # Snap to 1 m grid
+        res = 1.0
+        minx_snap = float(np.floor(minx))
+        maxy_snap = float(np.ceil(maxy))
+        width = int(np.ceil((maxx - minx_snap) / res))
+        height = int(np.ceil((maxy_snap - miny) / res))
+        transform = from_origin(minx_snap, maxy_snap, res, res)
+
+        meta = srcs[0].meta.copy()
+        meta.update({
+            "driver": "GTiff",
+            "count": 3,
+            "dtype": "uint8",
+            "height": height,
+            "width": width,
+            "transform": transform,
+            "crs": crs,
+            "compress": "deflate",
+            "BIGTIFF": "IF_NEEDED",
+            "tiled": True,
+            "blockxsize": 512,
+            "blockysize": 512,
+        })
+        ensure_dir(os.path.dirname(out_tif))
+        with rasterio.open(out_tif, "w", **meta) as dst:
+            # Build aligned VRTs for windowed reads
+            vrts: List[WarpedVRT] = []
+            for s in srcs:
+                try:
+                    v = WarpedVRT(
+                        s,
+                        crs=crs,
+                        transform=transform,
+                        width=width,
+                        height=height,
+                        resampling=Resampling.nearest,
+                        add_alpha=True,
+                        warp_extras={"NUM_THREADS": "ALL_CPUS"}
+                    )
+                except TypeError:
+                    v = WarpedVRT(
+                        s,
+                        crs=crs,
+                        transform=transform,
+                        width=width,
+                        height=height,
+                        resampling=Resampling.nearest,
+                        add_alpha=True,
+                    )
+                vrts.append(v)
+
+            try:
+                n_rows = int(np.ceil(height / float(chunk_size)))
+                n_cols = int(np.ceil(width / float(chunk_size)))
+                total_windows = n_rows * n_cols
+                for idx in tqdm(range(total_windows), desc="Mosaic windows", unit="win"):
+                    r = idx // n_cols
+                    c = idx % n_cols
+                    row_off = r * chunk_size
+                    col_off = c * chunk_size
+                    win_h = int(min(chunk_size, height - row_off))
+                    win_w = int(min(chunk_size, width - col_off))
+                    window = rasterio.windows.Window(col_off=col_off, row_off=row_off, width=win_w, height=win_h)
+
+                    tile = np.zeros((3, win_h, win_w), dtype=np.uint8)
+                    written = np.zeros((win_h, win_w), dtype=bool)
+
+                    for v in vrts:
+                        try:
+                            data = v.read(indexes=[1, 2, 3, 4], window=window, boundless=True, fill_value=0)
+                            if data.shape[0] < 4:
+                                rgb = data[:3]
+                                alpha = np.ones((1, win_h, win_w), dtype=np.uint8) * 255
+                                data = np.concatenate([rgb, alpha], axis=0)
+                        except Exception:
+                            continue
+
+                        alpha_mask = data[3] > 0
+                        to_write = (~written) & alpha_mask
+                        if not np.any(to_write):
+                            continue
+                        tile[:, to_write] = data[0:3, to_write]
+                        written[to_write] = True
+                        if np.all(written):
+                            break
+
+                    if np.any(written):
+                        dst.write(tile, window=window)
+            finally:
+                for v in vrts:
+                    try:
+                        v.close()
+                    except Exception:
+                        pass
+    finally:
+        for s in srcs:
+            try:
+                s.close()
+            except Exception:
+                pass
+
 def fetch_states(states: List[str]) -> gpd.GeoDataFrame:
     # Use Natural Earth admin 1 (states/provinces) via geopandas datasets
     try:
@@ -422,14 +543,30 @@ def main():
             print(f"[{st}] No tiles; skipping.")
             return ""
         print(f"[{st}] Mosaicking {len(tiles)} tiles → {out_tif}")
-        mosaic_rgb_1m(tiles, geom, out_tif)
+        # Use streaming mosaic to avoid huge arrays
+        mosaic_streaming_rgb_1m(tiles, geom, out_tif, chunk_size=1024)
         try:
             print(f"[{st}] Done: {os.path.basename(out_tif)} ({mb(os.path.getsize(out_tif)):.1f} MB)")
         except OSError:
             print(f"[{st}] Done: {os.path.basename(out_tif)}")
         return out_tif
 
-    # Process states sequentially to limit memory and output size pressure
+    # First pass: download tiles for all states (persist to outdir), skip mosaic
+    for _, row in states_gdf.iterrows():
+        st = row.STUSPS
+        geom = row.geometry
+        print(f"\n=== {st} (download) ===")
+        year = args.year or most_recent_naip_year_for_geom(geom)
+        if year is None:
+            print(f"[{st}] No NAIP available.")
+            continue
+        state_dir = os.path.join(args.outdir, st, str(year))
+        ensure_dir(state_dir)
+        tiles_dir = os.path.join(state_dir, "tiles")
+        ensure_dir(tiles_dir)
+        _ = download_tiles_for_geom(geom, year, tiles_dir, args.max_per_year, args.overwrite)
+
+    # Second pass: mosaic per state
     for _, row in states_gdf.iterrows():
         out = process_state(row)
         if out:
