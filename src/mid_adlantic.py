@@ -410,24 +410,24 @@ def main():
         # out paths
         state_dir = os.path.join(args.outdir, st, str(year))
         ensure_dir(state_dir)
-        out_tif = os.path.join(args.outdir, f"naip_{st}_{year}_mosaic_1m.tif")
+        tiles_dir = os.path.join(state_dir, "tiles")
+        ensure_dir(tiles_dir)
+        out_tif = os.path.join(state_dir, f"naip_{st}_{year}_mosaic_1m.tif")
         if (not args.overwrite) and os.path.exists(out_tif) and os.path.getsize(out_tif) > 0:
             print(f"[{st}] Exists → {os.path.basename(out_tif)} ({mb(os.path.getsize(out_tif)):.1f} MB). Skipping.")
             return out_tif
-        # temp
-        import tempfile
-        with tempfile.TemporaryDirectory(prefix=f"naip_{st}_", dir=args.tmpdir) as tmpdir:
-            tiles = download_tiles_for_geom(geom, year, tmpdir, args.max_per_year, args.overwrite)
-            if not tiles:
-                print(f"[{st}] No tiles; skipping.")
-                return ""
-            print(f"[{st}] Mosaicking {len(tiles)} tiles → {out_tif}")
-            mosaic_rgb_1m(tiles, geom, out_tif)
-            try:
-                print(f"[{st}] Done: {os.path.basename(out_tif)} ({mb(os.path.getsize(out_tif)):.1f} MB)")
-            except OSError:
-                print(f"[{st}] Done: {os.path.basename(out_tif)}")
-            return out_tif
+        # download tiles persistently under state_dir/tiles and mosaic
+        tiles = download_tiles_for_geom(geom, year, tiles_dir, args.max_per_year, args.overwrite)
+        if not tiles:
+            print(f"[{st}] No tiles; skipping.")
+            return ""
+        print(f"[{st}] Mosaicking {len(tiles)} tiles → {out_tif}")
+        mosaic_rgb_1m(tiles, geom, out_tif)
+        try:
+            print(f"[{st}] Done: {os.path.basename(out_tif)} ({mb(os.path.getsize(out_tif)):.1f} MB)")
+        except OSError:
+            print(f"[{st}] Done: {os.path.basename(out_tif)}")
+        return out_tif
 
     # Process states sequentially to limit memory and output size pressure
     for _, row in states_gdf.iterrows():
