@@ -526,9 +526,6 @@ def main():
         tiles_dir = os.path.join(state_dir, "tiles")
         ensure_dir(tiles_dir)
         out_tif = os.path.join(state_dir, f"naip_{st}_{year}_mosaic_1m.tif")
-        if (not args.overwrite) and os.path.exists(out_tif) and os.path.getsize(out_tif) > 0:
-            print(f"[{st}] Exists → {os.path.basename(out_tif)} ({mb(os.path.getsize(out_tif)):.1f} MB). Skipping.")
-            return out_tif
         # gather tiles from persistent tiles dir; don't redownload
         tiles = sorted([os.path.join(tiles_dir, f) for f in os.listdir(tiles_dir) if f.lower().endswith((".tif", ".tiff"))])
         if not tiles:
