@@ -344,15 +344,8 @@ def mosaic_streaming_rgb_1m(src_paths: List[str], bounds_geom: BaseGeometry, out
 
     srcs = [rasterio.open(p) for p in src_paths]
     try:
-        # Determine target CRS and bounds in that CRS
-        crs = None
-        try:
-            crs = srcs[0].crs
-        except Exception:
-            pass
-        if not crs:
-            crs = target_crs
-
+        # Use a fixed target CRS for consistency across states
+        crs = target_crs
         minx, miny, maxx, maxy = transform_bounds("EPSG:4326", crs, *bounds_geom.bounds, densify_pts=21)
 
         # Snap to 1 m grid
@@ -377,6 +370,8 @@ def mosaic_streaming_rgb_1m(src_paths: List[str], bounds_geom: BaseGeometry, out
             "tiled": True,
             "blockxsize": 512,
             "blockysize": 512,
+            "photometric": "rgb",
+            "predictor": 2,
         })
         ensure_dir(os.path.dirname(out_tif))
         with rasterio.open(out_tif, "w", **meta) as dst:
@@ -391,7 +386,7 @@ def mosaic_streaming_rgb_1m(src_paths: List[str], bounds_geom: BaseGeometry, out
                         width=width,
                         height=height,
                         resampling=Resampling.nearest,
-                        add_alpha=True,
+                        add_alpha=False,
                         warp_extras={"NUM_THREADS": "ALL_CPUS"}
                     )
                 except TypeError:
@@ -402,7 +397,7 @@ def mosaic_streaming_rgb_1m(src_paths: List[str], bounds_geom: BaseGeometry, out
                         width=width,
                         height=height,
                         resampling=Resampling.nearest,
-                        add_alpha=True,
+                        add_alpha=False,
                     )
                 vrts.append(v)
 
@@ -424,19 +419,16 @@ def mosaic_streaming_rgb_1m(src_paths: List[str], bounds_geom: BaseGeometry, out
 
                     for v in vrts:
                         try:
-                            data = v.read(indexes=[1, 2, 3, 4], window=window, boundless=True, fill_value=0)
-                            if data.shape[0] < 4:
-                                rgb = data[:3]
-                                alpha = np.ones((1, win_h, win_w), dtype=np.uint8) * 255
-                                data = np.concatenate([rgb, alpha], axis=0)
+                            rgb = v.read(indexes=[1, 2, 3], window=window, boundless=True, fill_value=0)
+                            # Use dataset mask (COG internal mask or nodata) for coverage
+                            mask = v.read_masks(1, window=window) > 0
                         except Exception:
                             continue
 
-                        alpha_mask = data[3] > 0
-                        to_write = (~written) & alpha_mask
+                        to_write = (~written) & mask
                         if not np.any(to_write):
                             continue
-                        tile[:, to_write] = data[0:3, to_write]
+                        tile[:, to_write] = rgb[:, to_write]
                         written[to_write] = True
                         if np.all(written):
                             break
@@ -537,25 +529,28 @@ def main():
         if (not args.overwrite) and os.path.exists(out_tif) and os.path.getsize(out_tif) > 0:
             print(f"[{st}] Exists → {os.path.basename(out_tif)} ({mb(os.path.getsize(out_tif)):.1f} MB). Skipping.")
             return out_tif
-        # download tiles persistently under state_dir/tiles and mosaic
-        tiles = download_tiles_for_geom(geom, year, tiles_dir, args.max_per_year, args.overwrite)
+        # gather tiles from persistent tiles dir; don't redownload
+        tiles = sorted([os.path.join(tiles_dir, f) for f in os.listdir(tiles_dir) if f.lower().endswith((".tif", ".tiff"))])
+        if not tiles:
+            # fallback to download if empty
+            tiles = download_tiles_for_geom(geom, year, tiles_dir, args.max_per_year, args.overwrite)
         if not tiles:
             print(f"[{st}] No tiles; skipping.")
             return ""
         print(f"[{st}] Mosaicking {len(tiles)} tiles → {out_tif}")
         # Use streaming mosaic to avoid huge arrays
-        mosaic_streaming_rgb_1m(tiles, geom, out_tif, chunk_size=1024)
+        mosaic_streaming_rgb_1m(tiles, geom, out_tif, chunk_size=2048)
         try:
             print(f"[{st}] Done: {os.path.basename(out_tif)} ({mb(os.path.getsize(out_tif)):.1f} MB)")
         except OSError:
             print(f"[{st}] Done: {os.path.basename(out_tif)}")
         return out_tif
 
-    # First pass: download tiles for all states (persist to outdir), skip mosaic
+    # First pass: ensure tiles for all states exist (skip download if already present)
     for _, row in states_gdf.iterrows():
         st = row.STUSPS
         geom = row.geometry
-        print(f"\n=== {st} (download) ===")
+        print(f"\n=== {st} (ensure tiles) ===")
         year = args.year or most_recent_naip_year_for_geom(geom)
         if year is None:
             print(f"[{st}] No NAIP available.")
@@ -564,7 +559,9 @@ def main():
         ensure_dir(state_dir)
         tiles_dir = os.path.join(state_dir, "tiles")
         ensure_dir(tiles_dir)
-        _ = download_tiles_for_geom(geom, year, tiles_dir, args.max_per_year, args.overwrite)
+        existing = [f for f in os.listdir(tiles_dir) if f.lower().endswith((".tif", ".tiff"))]
+        if not existing or args.overwrite:
+            _ = download_tiles_for_geom(geom, year, tiles_dir, args.max_per_year, args.overwrite)
 
     # Second pass: mosaic per state
     for _, row in states_gdf.iterrows():
@@ -572,54 +569,7 @@ def main():
         if out:
             per_state_outputs.append(out)
 
-    # Combined mosaic across states
-    if per_state_outputs:
-        print("\n=== Combined mosaic ===")
-        combined_tif = os.path.join(args.outdir, "naip_midatlantic_mosaic_1m.tif")
-        if (not args.overwrite) and os.path.exists(combined_tif) and os.path.getsize(combined_tif) > 0:
-            print(f"Exists → {os.path.basename(combined_tif)} ({mb(os.path.getsize(combined_tif)):.1f} MB). Skipping.")
-            return
-        total_geom = unary_union(list(states_gdf.geometry)).buffer(0)
-        # Open per-state mosaics as inputs
-        srcs = [rasterio.open(p) for p in per_state_outputs]
-        try:
-            # Assume all are already EPSG:5070 1 m RGB
-            bounds = total_geom.bounds
-            minx, miny, maxx, maxy = transform_bounds("EPSG:4326", srcs[0].crs, *bounds, densify_pts=21)
-            mosaic_arr, mosaic_transform = rio_merge(
-                srcs,
-                bounds=(minx, miny, maxx, maxy),
-                res=(1.0, 1.0),
-                method="first",
-                indexes=[1, 2, 3],
-            )
-            meta = srcs[0].meta.copy()
-            meta.update({
-                "count": mosaic_arr.shape[0],
-                "height": mosaic_arr.shape[1],
-                "width": mosaic_arr.shape[2],
-                "transform": mosaic_transform,
-                "compress": "deflate",
-                "BIGTIFF": "IF_NEEDED",
-            })
-            if "nodata" in meta:
-                try:
-                    del meta["nodata"]
-                except Exception:
-                    pass
-            ensure_dir(os.path.dirname(combined_tif))
-            with rasterio.open(combined_tif, "w", **meta) as dst:
-                dst.write(mosaic_arr)
-            try:
-                print(f"Done: {os.path.basename(combined_tif)} ({mb(os.path.getsize(combined_tif)):.1f} MB)")
-            except OSError:
-                print(f"Done: {os.path.basename(combined_tif)}")
-        finally:
-            for s in srcs:
-                try:
-                    s.close()
-                except Exception:
-                    pass
+    # Skip making a combined mosaic across states per user request
 
 
 if __name__ == "__main__":
